@@ -177,7 +177,7 @@ pub fn unpack_snac_from_7(tokens: &[u32]) -> [Vec<u32>; 3] {
         _ => tokens,
     };
     let (mut l1, mut l2, mut l3) = (vec![], vec![], vec![]);
-    for frame in toks.chunks_exact(SNAC_TOKENS_PER_FRAME) {
+    for frame in toks.as_chunks::<SNAC_TOKENS_PER_FRAME>().0 {
         // each slot carries its own 4096 offset on top of CODE_TOKEN_OFFSET
         let c: Vec<u32> = frame
             .iter()

@@ -1,0 +1,45 @@
+[package]
+name = "freshrss-tts"
+version = "0.1.0"
+edition = "2021"
+description = "Narrate FreshRSS stories locally: a small LLM director inserts emotion tags, a GPU TTS reads them."
+license = "Apache-2.0"
+repository = "https://github.com/prettyboiiii/freshrss-tts"
+readme = "README.md"
+
+[dependencies]
+anyhow = "1.0.104"
+candle-core = "0.10.2"
+candle-nn = "0.10.2"
+candle-transformers = "0.10.2"
+clap = { version = "4.5.61", features = ["derive", "env"] }
+html-escape = "0.3.0"
+regex = "1.13.1"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+ureq = { version = "2", features = ["json"] }
+
+[features]
+# Helpers for tests (fabricating a zero-weight SNAC model directory). Not for production use.
+testing = []
+
+[dev-dependencies]
+freshrss-tts = { path = ".", features = ["testing"] }
+tempfile = "3.27.0"
+
+[[bin]]
+name = "freshrss-tts"
+path = "src/main.rs"
+
+# See vendor/candle-core/PATCHES.md: upstream cannot resolve until it moves off yanked `zip` releases.
+[patch.crates-io]
+candle-core = { path = "vendor/candle-core" }
+
+# candle's convolutions are painfully slow unoptimised; optimise dependencies (not our own code) in
+# dev and test builds so `cargo test` and `cargo run` stay usable.
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.release]
+lto = "thin"
+codegen-units = 4

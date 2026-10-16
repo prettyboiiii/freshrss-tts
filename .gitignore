@@ -1,0 +1,8 @@
+/target
+out/
+*.wav
+*.mp3
+*.opus
+*.gguf
+.env
+models/

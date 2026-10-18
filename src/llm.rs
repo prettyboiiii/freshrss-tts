@@ -29,7 +29,7 @@ impl ChatClient {
             extra_body: json!({"chat_template_kwargs": {"enable_thinking": false}}),
             agent: ureq::AgentBuilder::new()
                 .timeout_connect(Duration::from_secs(10))
-                .timeout_read(Duration::from_secs(900))
+                .timeout_read(Duration::from_secs(3600))
                 .build(),
         }
     }

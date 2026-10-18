@@ -83,6 +83,7 @@ fn synth_builds_the_prompt_unpacks_frames_and_decodes() {
         text: "<whisper> Don't look.".into(),
         style: "Old man, low".into(),
         pause_ms: 250,
+        parts: Vec::new(),
     };
     let pcm = engine.synth(&chunk).unwrap();
 

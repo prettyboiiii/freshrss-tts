@@ -98,6 +98,7 @@ pub fn render(segments: &[Segment], narrator_voice: &str, max_chars: usize) -> V
         style: String,
         tag: Option<&'static str>,
         parts: Vec<String>,
+        map: Vec<(usize, usize)>,
         len: usize,
         pause: u32,
     }
@@ -115,6 +116,7 @@ pub fn render(segments: &[Segment], narrator_voice: &str, max_chars: usize) -> V
                 text: text.trim().to_string(),
                 style: o.style,
                 pause_ms: o.pause,
+                parts: o.map,
             });
         }
     };
@@ -155,10 +157,12 @@ pub fn render(segments: &[Segment], narrator_voice: &str, max_chars: usize) -> V
                 style: style.clone(),
                 tag,
                 parts: vec![],
+                map: vec![],
                 len: 0,
                 pause: 0,
             });
             o.parts.push(text);
+            o.map.push((seg.idx, piece.chars().count()));
             o.len += tlen + 1;
             o.pause = if last_piece { d.pause_ms } else { 120 };
             if o.pause >= BREAK_PAUSE_MS {

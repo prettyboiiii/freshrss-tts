@@ -299,6 +299,13 @@ fn narrate(file: &str, tts: &TtsArgs, d: &DirectorArgs, out: &Path, plain: bool)
         &d.options(),
         out,
     )?;
+    // Read-along data next to the audio: sentence times for the player page.
+    let timings_path = out.with_extension("timings.json");
+    let audio_name = out.file_name().map(|n| n.to_string_lossy().into_owned());
+    std::fs::write(
+        &timings_path,
+        serde_json::to_string_pretty(&json!({"audio": audio_name, "sentences": res.timings}))?,
+    )?;
     println!(
         "{}: {:.1} s of audio in {:.1} s (RTF {:.2}), {} generations, {} LLM fixes; peak GPU {}",
         out.display(),

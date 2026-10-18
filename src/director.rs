@@ -7,9 +7,11 @@
 //! instead of failing the job.
 
 use anyhow::Result;
+use regex::Regex;
 use serde::Serialize;
 use serde_json::{json, Map, Value};
 use std::collections::HashMap;
+use std::sync::LazyLock;
 
 use crate::textprep::{Sentence, Span};
 
@@ -238,18 +240,43 @@ fn loads(raw: &str) -> Option<Map<String, Value>> {
     })
 }
 
+const SPEECH_VERBS: &str =
+    "told|said|asked|replied|answered|whispered|shouted|yelled|screamed|muttered|added|called|begged";
+
+/// True when the narrator ("I") is the one speaking the first quote of a sentence, as in
+/// `I told him, "..."` or `"...," I said.` The small director model often hands those to a character.
+fn narrator_speaks(spans: &[Span]) -> bool {
+    static BEFORE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(&format!(r"\bI\s+(?:\w+\s+){{0,2}}(?i:{SPEECH_VERBS})\b[^.!?]*$")).unwrap()
+    });
+    static AFTER: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(&format!(r"^[\s,.]*I\s+(?:\w+\s+){{0,2}}(?i:{SPEECH_VERBS})\b")).unwrap()
+    });
+    let Some(q) = spans.iter().position(|p| p.quoted) else {
+        return false;
+    };
+    let before = q
+        .checked_sub(1)
+        .and_then(|i| spans.get(i))
+        .is_some_and(|p| BEFORE.is_match(&p.text));
+    let after = spans
+        .get(q + 1)
+        .is_some_and(|p| !p.quoted && AFTER.is_match(&p.text));
+    before || after
+}
+
 pub fn default_pause_ms(text: &str, last_in_paragraph: bool) -> u32 {
     if last_in_paragraph {
         900
     } else if text.ends_with('\u{2026}') || text.ends_with("...") {
-        300
+        500
     } else if text
         .trim_end_matches(['"', '\'', '\u{201d}', '\u{2019}', ')'])
         .ends_with(['?', '!'])
     {
-        200
+        350
     } else {
-        120
+        250
     }
 }
 
@@ -355,6 +382,7 @@ pub fn resolve(sentences: &[Sentence], raw: Option<&str>, state: Directive) -> R
         // over several sentences keeps its speaker.
         let has_quote = s.spans.iter().any(|p| p.quoted);
         speaker = match ev.get("speaker").and_then(Value::as_str).map(str::trim) {
+            _ if narrator_speaks(&s.spans) => None,
             Some(v) if has_quote && !v.is_empty() => Some(v.chars().take(MAX_SPEAKER_CHARS).collect()),
             _ if has_quote && s.continues_quote => speaker.take(),
             _ => None,
@@ -561,10 +589,10 @@ mod tests {
         );
         assert_eq!(plan.segments[0].directive.pause_ms, MAX_PAUSE_MS);
         assert_eq!(plan.segments[1].directive.pause_ms, 900); // last sentence of its paragraph
-        assert_eq!(default_pause_ms("What?", false), 200);
-        assert_eq!(default_pause_ms("He said \"run!\"", false), 200);
-        assert_eq!(default_pause_ms("Wait...", false), 300);
-        assert_eq!(default_pause_ms("Fine.", false), 120);
+        assert_eq!(default_pause_ms("What?", false), 350);
+        assert_eq!(default_pause_ms("He said \"run!\"", false), 350);
+        assert_eq!(default_pause_ms("Wait...", false), 500);
+        assert_eq!(default_pause_ms("Fine.", false), 250);
     }
 
     #[test]
@@ -585,6 +613,21 @@ mod tests {
             .collect();
         assert_eq!(long, [true, false, false, false, false, false, true, false]);
         assert!(r.repaired >= 6);
+    }
+
+    #[test]
+    fn narrators_own_quotes_never_get_a_character_voice() {
+        let sentences = split_sentences(
+            "My brother turned and I told him, \"Someone is waiting.\" \"Go away,\" I said. \"Stop,\" he said.",
+        );
+        let raw = json!({"narrator_voice": "v", "events": [
+            {"i": 0, "speaker": "boy, about 12"}, {"i": 1, "speaker": "boy, about 12"},
+            {"i": 2, "speaker": "boy, about 12"},
+        ]})
+        .to_string();
+        let r = resolve(&sentences, Some(&raw), Directive::default());
+        let who: Vec<_> = r.segments.iter().map(|s| s.speaker.as_deref()).collect();
+        assert_eq!(who, [None, None, Some("boy, about 12")]);
     }
 
     #[test]

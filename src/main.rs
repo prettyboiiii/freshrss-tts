@@ -25,6 +25,8 @@ struct Cli {
     cmd: Cmd,
 }
 
+// parsed once at start-up, so the size of the largest variant does not matter
+#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand)]
 enum Cmd {
     /// Log in to FreshRSS and list the entries under the narrate labels
@@ -83,9 +85,18 @@ enum Cmd {
         /// Label put on a story once it is narrated (the story keeps its other labels)
         #[arg(long, default_value = "narrated")]
         done_label: String,
-        /// Most stories to narrate in one run
+        /// Label put on a story that could not be narrated, so it is not retried forever
+        #[arg(long, default_value = "narrate-failed")]
+        failed_label: String,
+        /// Most stories to narrate in one pass
         #[arg(long, default_value_t = 3)]
         max: usize,
+        /// Keep running: look again every this many seconds instead of exiting after one pass
+        #[arg(long)]
+        watch: Option<u64>,
+        /// Seconds to wait for the model servers to finish loading before narrating
+        #[arg(long, default_value_t = 1200)]
+        ready_timeout: u64,
         /// Directory the audio, episode files and feed.xml go to
         #[arg(long, default_value = "out/podcast")]
         out: PathBuf,
@@ -103,6 +114,20 @@ enum Cmd {
         tts: TtsArgs,
         #[command(flatten)]
         director: DirectorArgs,
+    },
+    /// Serve `{"queue": N}` (stories waiting under the narrate labels) for KEDA to scale on
+    Queue {
+        #[arg(long, env = "FRESHRSS_URL")]
+        url: String,
+        #[arg(long, env = "FRESHRSS_USER")]
+        user: String,
+        #[arg(long, env = "FRESHRSS_API_PASSWORD", hide_env_values = true)]
+        api_password: String,
+        /// Repeatable; default: narrate, narrate-scary
+        #[arg(long = "label")]
+        labels: Vec<String>,
+        #[arg(long, default_value = "0.0.0.0:8080")]
+        listen: String,
     },
     /// Bake-off: fixed A/B samples (plain vs directed) with timing and peak GPU memory
     Bench {
@@ -215,7 +240,10 @@ fn main() -> Result<()> {
             api_password,
             labels,
             done_label,
+            failed_label,
             max,
+            watch,
+            ready_timeout,
             out,
             public_url,
             feed_title,
@@ -223,21 +251,35 @@ fn main() -> Result<()> {
             dry_run,
             tts,
             director,
-        } => work(
-            &WorkOpts {
+        } => {
+            let opts = WorkOpts {
                 labels,
                 done_label,
+                failed_label,
                 max,
+                ready_timeout,
                 out,
                 public_url,
                 feed_title,
                 bitrate,
                 dry_run,
-            },
-            FreshRss::new(&url, &user, &api_password),
-            &tts,
-            &director,
-        ),
+            };
+            loop {
+                let pass = work(&opts, FreshRss::new(&url, &user, &api_password), &tts, &director);
+                let Some(secs) = watch else { break pass };
+                if let Err(e) = pass {
+                    eprintln!("pass failed: {e:#}");
+                }
+                std::thread::sleep(std::time::Duration::from_secs(secs));
+            }
+        }
+        Cmd::Queue {
+            url,
+            user,
+            api_password,
+            labels,
+            listen,
+        } => queue_server(&listen, FreshRss::new(&url, &user, &api_password), &labels),
         Cmd::Bench { tts, director, out } => run_bench(&tts, &director, &out),
     }
 }
@@ -404,7 +446,9 @@ fn narrate_story(
 struct WorkOpts {
     labels: Vec<String>,
     done_label: String,
+    failed_label: String,
     max: usize,
+    ready_timeout: u64,
     out: PathBuf,
     public_url: String,
     feed_title: String,
@@ -414,22 +458,7 @@ struct WorkOpts {
 
 fn work(w: &WorkOpts, mut fr: FreshRss, tts: &TtsArgs, d: &DirectorArgs) -> Result<()> {
     fr.login()?;
-    let labels = if w.labels.is_empty() {
-        vec!["narrate".to_string(), "narrate-scary".to_string()]
-    } else {
-        w.labels.clone()
-    };
-    let mut todo = Vec::new();
-    for label in &labels {
-        for e in fr.label_entries(label, w.max.max(10))? {
-            if !todo
-                .iter()
-                .any(|(_, t): &(String, freshrss_tts::freshrss::Entry)| t.id == e.id)
-            {
-                todo.push((label.clone(), e));
-            }
-        }
-    }
+    let todo = waiting(&mut fr, &w.labels, w.max.max(10))?;
     let (new, finished): (Vec<_>, Vec<_>) = todo.into_iter().partition(|(_, e)| {
         !w.out
             .join(format!("{}{}", worker::slug(&e.id), worker::EPISODE_SUFFIX))
@@ -457,9 +486,14 @@ fn work(w: &WorkOpts, mut fr: FreshRss, tts: &TtsArgs, d: &DirectorArgs) -> Resu
     std::fs::create_dir_all(&w.out)?;
     // A previous run narrated these but could not relabel them.
     for (label, e) in &finished {
-        relabel(&mut fr, w, label, e);
+        relabel(&mut fr, e, label, &w.done_label);
     }
     if !new.is_empty() {
+        let servers: Vec<String> = [Some(tts.server.clone()), d.llm_url.clone()]
+            .into_iter()
+            .flatten()
+            .collect();
+        worker::wait_ready(&servers, std::time::Duration::from_secs(w.ready_timeout))?;
         let mut engine = tts.engine()?;
         let llm = d.client();
         for (label, e) in new.iter().take(w.max) {
@@ -476,9 +510,12 @@ fn work(w: &WorkOpts, mut fr: FreshRss, tts: &TtsArgs, d: &DirectorArgs) -> Resu
                         "narrated {:?}: {:.0} s, {} bytes",
                         e.title, ep.duration_s, ep.audio_bytes
                     );
-                    relabel(&mut fr, w, label, e);
+                    relabel(&mut fr, e, label, &w.done_label);
                 }
-                Err(err) => eprintln!("could not narrate {:?}: {err:#}", e.title),
+                Err(err) => {
+                    eprintln!("could not narrate {:?}: {err:#}", e.title);
+                    relabel(&mut fr, e, label, &w.failed_label);
+                }
             }
         }
     }
@@ -491,12 +528,71 @@ fn work(w: &WorkOpts, mut fr: FreshRss, tts: &TtsArgs, d: &DirectorArgs) -> Resu
     Ok(())
 }
 
-/// Swap the narrate label for the done label. Failing is not fatal: the episode file exists, so the
-/// next run only retries this step.
-fn relabel(fr: &mut FreshRss, w: &WorkOpts, label: &str, e: &freshrss_tts::freshrss::Entry) {
-    if let Err(err) = fr.edit_labels(std::slice::from_ref(&e.id), &[w.done_label.as_str()], &[label]) {
+/// Stories waiting under any of `labels` (default: narrate, narrate-scary), newest first, each once.
+fn waiting(
+    fr: &mut FreshRss,
+    labels: &[String],
+    per_label: usize,
+) -> Result<Vec<(String, freshrss_tts::freshrss::Entry)>> {
+    let labels = if labels.is_empty() {
+        vec!["narrate".to_string(), "narrate-scary".to_string()]
+    } else {
+        labels.to_vec()
+    };
+    let mut found: Vec<(String, freshrss_tts::freshrss::Entry)> = Vec::new();
+    for label in &labels {
+        for e in fr.label_entries(label, per_label)? {
+            if !found.iter().any(|(_, f)| f.id == e.id) {
+                found.push((label.clone(), e));
+            }
+        }
+    }
+    Ok(found)
+}
+
+/// Swap `from` for `to` on a story. Failing is not fatal: for a narrated story the episode file
+/// exists, so the next pass only retries this step.
+fn relabel(fr: &mut FreshRss, e: &freshrss_tts::freshrss::Entry, from: &str, to: &str) {
+    if let Err(err) = fr.edit_labels(std::slice::from_ref(&e.id), &[to], &[from]) {
         eprintln!("could not relabel {:?}: {err:#}", e.title);
     }
+}
+
+/// Minimal HTTP endpoint for KEDA's `metrics-api` scaler: every request gets `{"queue": N}`.
+fn queue_server(listen: &str, mut fr: FreshRss, labels: &[String]) -> Result<()> {
+    use std::io::{BufRead, BufReader, Write};
+    let listener = std::net::TcpListener::bind(listen).with_context(|| format!("listening on {listen}"))?;
+    println!("serving the queue length on {listen}");
+    for stream in listener.incoming() {
+        let Ok(mut stream) = stream else { continue };
+        let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));
+        // drain the request head; the answer does not depend on it
+        let mut reader = BufReader::new(&stream);
+        let mut line = String::new();
+        while reader.read_line(&mut line).is_ok_and(|n| n > 2) {
+            line.clear();
+        }
+        let answer = fr
+            .login()
+            .and_then(|()| waiting(&mut fr, labels, 50))
+            .map(|found| found.len());
+        let (status, body) = match answer {
+            Ok(n) => ("200 OK", json!({"queue": n}).to_string()),
+            Err(e) => {
+                eprintln!("queue lookup failed: {e:#}");
+                (
+                    "503 Service Unavailable",
+                    json!({"error": "lookup failed"}).to_string(),
+                )
+            }
+        };
+        let _ = write!(
+            stream,
+            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+    }
+    Ok(())
 }
 
 fn narrate_entry(

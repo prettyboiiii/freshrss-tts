@@ -3,6 +3,7 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 pub const EPISODE_SUFFIX: &str = ".episode.json";
 
@@ -59,6 +60,30 @@ pub fn load_episodes(dir: &Path) -> Result<Vec<Episode>> {
         }
     }
     Ok(episodes)
+}
+
+/// Wait until every llama-server answers `/health` with something other than 503 (still loading) or a
+/// connection error. Scaled up from zero, the servers need minutes to load their models.
+pub fn wait_ready(urls: &[String], timeout: Duration) -> Result<()> {
+    let start = Instant::now();
+    for url in urls {
+        let health = format!("{}/health", url.trim_end_matches('/'));
+        while !answers(&health) {
+            if start.elapsed() > timeout {
+                anyhow::bail!("{health} was not ready after {timeout:?}");
+            }
+            std::thread::sleep(Duration::from_secs(5));
+        }
+    }
+    Ok(())
+}
+
+fn answers(health: &str) -> bool {
+    match ureq::get(health).timeout(Duration::from_secs(5)).call() {
+        Ok(_) => true,
+        Err(ureq::Error::Status(code, _)) => code != 503,
+        Err(_) => false,
+    }
 }
 
 fn xml_escape(s: &str) -> String {

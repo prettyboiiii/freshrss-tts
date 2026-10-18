@@ -426,7 +426,7 @@ fn narrate(file: &str, tts: &TtsArgs, d: &DirectorArgs, out: &Path, plain: bool)
         &d.options(),
         out,
         &name,
-        &mut |_, _| {},
+        &mut |_, _| Ok(()),
     )?;
     println!(
         "{}: {:.1} s of audio in {:.1} s (RTF {:.2}), {} generations, {} LLM fixes; peak GPU {}",
@@ -450,7 +450,7 @@ fn narrate_story(
     opts: &PlanOptions,
     out_wav: &Path,
     audio_name: &str,
-    progress: &mut dyn FnMut(usize, usize),
+    progress: &mut dyn FnMut(usize, usize) -> Result<()>,
 ) -> Result<pipeline::Narrated> {
     let res = pipeline::narrate(sentences, engine, llm, opts, out_wav, progress)?;
     std::fs::write(
@@ -502,6 +502,8 @@ fn work(w: &WorkOpts, mut fr: FreshRss, tts: &TtsArgs, d: &DirectorArgs) -> Resu
         return Ok(());
     }
     std::fs::create_dir_all(&w.out)?;
+    // A cancel request from before this pass has already removed its labels (see worker::CANCEL_FILE).
+    let _ = std::fs::remove_file(w.out.join(worker::CANCEL_FILE));
     // A previous run narrated these but could not relabel them.
     for (label, e) in &finished {
         relabel(&mut fr, e, label, &w.done_label);
@@ -538,6 +540,13 @@ fn work(w: &WorkOpts, mut fr: FreshRss, tts: &TtsArgs, d: &DirectorArgs) -> Resu
                 &mut status,
             );
             status.remove(&worker::slug(&e.id));
+            if result.is_err() && w.out.join(worker::CANCEL_FILE).exists() {
+                // Cancelled from the web UI, which also took the labels off the whole queue: no relabel, no
+                // notification, and the stories after this one stay un-narrated.
+                eprintln!("cancelled while narrating {:?}", e.title);
+                let _ = std::fs::remove_file(w.out.join(worker::CANCEL_FILE));
+                break;
+            }
             match result {
                 Ok(ep) => {
                     println!(
@@ -682,7 +691,13 @@ fn narrate_entry(
         &opts,
         &wav,
         &audio_file,
-        &mut |done, total| status.progress(&slug, done, total),
+        &mut |done, total| {
+            status.progress(&slug, done, total);
+            if w.out.join(worker::CANCEL_FILE).exists() {
+                bail!("cancelled");
+            }
+            Ok(())
+        },
     )?;
     let opus = w.out.join(&audio_file);
     freshrss_tts::audio::encode(&wav, &opus, &w.bitrate)?;

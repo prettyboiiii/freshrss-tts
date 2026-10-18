@@ -43,6 +43,10 @@ pub fn slug(entry_id: &str) -> String {
     }
 }
 
+/// The web UI creates `<out>/cancel` after it has taken the narrate labels off every waiting story. The
+/// worker checks it between chunks, abandons the story in progress and stops the pass.
+pub const CANCEL_FILE: &str = "cancel";
+
 pub const STATUS_FILE: &str = "status.json";
 
 /// A story this pass is going to narrate. `done`/`total` count synthesised chunks; `total` is 0 until

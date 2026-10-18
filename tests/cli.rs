@@ -44,7 +44,7 @@ fn director_reply() -> Value {
 fn help_lists_the_commands() {
     let o = run(&["--help"]);
     assert!(o.status.success());
-    for cmd in ["check", "plan", "tags", "narrate", "bench"] {
+    for cmd in ["check", "plan", "tags", "narrate", "work", "bench"] {
         assert!(out(&o).contains(cmd), "{cmd} missing from help");
     }
 }
@@ -303,4 +303,100 @@ fn bench_writes_wavs_and_metrics() {
         serde_json::from_str(&std::fs::read_to_string(outdir.join("metrics.json")).unwrap()).unwrap();
     assert_eq!(metrics["cases"].as_array().unwrap().len(), 7);
     assert!(text.contains("RTF"));
+}
+
+fn opus_available() -> bool {
+    Command::new("ffmpeg")
+        .args(["-hide_banner", "-encoders"])
+        .output()
+        .is_ok_and(|o| String::from_utf8_lossy(&o.stdout).contains("libopus"))
+}
+
+fn work_args<'a>(fr: &'a str, out: &'a str) -> Vec<&'a str> {
+    vec![
+        "work",
+        "--url",
+        fr,
+        "--user",
+        "me",
+        "--api-password",
+        "pw",
+        "--label",
+        "narrate-scary",
+        "--public-url",
+        "https://tts.example/podcast",
+        "--out",
+        out,
+    ]
+}
+
+#[test]
+fn work_dry_run_lists_stories_and_changes_nothing() {
+    let fr = MockServer::start(fake_freshrss);
+    let dir = tempfile::tempdir().unwrap();
+    let out_dir = dir.path().join("pod");
+    let mut args = work_args(&fr.url, out_dir.to_str().unwrap());
+    args.push("--dry-run");
+    let o = run(&args);
+    assert!(o.status.success(), "{}", err(&o));
+    assert!(
+        out(&o).contains("would narrate [narrate-scary] \"The Lighthouse Keeper\" -> 00000000000000a1.opus"),
+        "{}",
+        out(&o)
+    );
+    assert!(!out_dir.exists());
+    assert!(fr.requests().iter().all(|r| !r.path().ends_with("/edit-tag")));
+}
+
+#[test]
+fn work_narrates_encodes_publishes_a_feed_and_relabels() {
+    if !opus_available() {
+        eprintln!("skipped: ffmpeg with libopus not installed");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let snac = dir.path().join("snac");
+    std::fs::create_dir(&snac).unwrap();
+    freshrss_tts::testing::write_zero_weight_snac(&snac).unwrap();
+    let fr = MockServer::start(fake_freshrss);
+    let tts = llama_mock(speech_tokens(2));
+    let out_dir = dir.path().join("pod");
+    let mut args = work_args(&fr.url, out_dir.to_str().unwrap());
+    args.extend(["--server", &tts.url, "--snac-dir", snac.to_str().unwrap()]);
+
+    let o = run(&args);
+    assert!(o.status.success(), "{}", err(&o));
+    assert!(out(&o).contains("feed.xml: 1 episodes"), "{}", out(&o));
+
+    let slug = "00000000000000a1";
+    assert!(out_dir.join(format!("{slug}.opus")).metadata().unwrap().len() > 0);
+    assert!(
+        !out_dir.join(format!("{slug}.wav")).exists(),
+        "the WAV is replaced by the encoded file"
+    );
+    assert!(out_dir.join(format!("{slug}.timings.json")).exists());
+    let feed = std::fs::read_to_string(out_dir.join("feed.xml")).unwrap();
+    assert!(
+        feed.contains("The Lighthouse Keeper")
+            && feed.contains(&format!("https://tts.example/podcast/{slug}.opus"))
+    );
+
+    let tag = fr
+        .requests()
+        .into_iter()
+        .find(|r| r.path().ends_with("/edit-tag"))
+        .expect("relabelled");
+    assert!(tag.body.contains("a=user%2F-%2Flabel%2Fnarrated"), "{}", tag.body);
+    assert!(
+        tag.body.contains("r=user%2F-%2Flabel%2Fnarrate-scary"),
+        "{}",
+        tag.body
+    );
+
+    // The story is still labelled in the mock, so a second run only relabels it.
+    let before = tts.requests().len();
+    let o = run(&args);
+    assert!(o.status.success(), "{}", err(&o));
+    assert!(out(&o).contains("0 stories to narrate"), "{}", out(&o));
+    assert_eq!(tts.requests().len(), before, "nothing was narrated twice");
 }

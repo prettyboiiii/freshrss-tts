@@ -11,6 +11,8 @@ use freshrss_tts::engines::maya1_llamacpp::{Maya1LlamaCpp, SnacDecoder};
 use freshrss_tts::freshrss::FreshRss;
 use freshrss_tts::llm::ChatClient;
 use freshrss_tts::pipeline;
+use freshrss_tts::textprep::Sentence;
+use freshrss_tts::worker::{self, Episode};
 
 #[derive(Parser)]
 #[command(
@@ -66,6 +68,41 @@ enum Cmd {
         /// Skip the director: plain neutral narration
         #[arg(long)]
         plain: bool,
+    },
+    /// Narrate the stories under the narrate labels, publish a podcast feed, relabel them `narrated`
+    Work {
+        #[arg(long, env = "FRESHRSS_URL")]
+        url: String,
+        #[arg(long, env = "FRESHRSS_USER")]
+        user: String,
+        #[arg(long, env = "FRESHRSS_API_PASSWORD", hide_env_values = true)]
+        api_password: String,
+        /// Repeatable; default: narrate, narrate-scary
+        #[arg(long = "label")]
+        labels: Vec<String>,
+        /// Label put on a story once it is narrated (the story keeps its other labels)
+        #[arg(long, default_value = "narrated")]
+        done_label: String,
+        /// Most stories to narrate in one run
+        #[arg(long, default_value_t = 3)]
+        max: usize,
+        /// Directory the audio, episode files and feed.xml go to
+        #[arg(long, default_value = "out/podcast")]
+        out: PathBuf,
+        /// Where `out` is served from, used for the audio links in the feed
+        #[arg(long, env = "PUBLIC_URL")]
+        public_url: String,
+        #[arg(long, default_value = "Narrated stories")]
+        feed_title: String,
+        #[arg(long, default_value = "32k")]
+        bitrate: String,
+        /// List what would be narrated; change nothing
+        #[arg(long)]
+        dry_run: bool,
+        #[command(flatten)]
+        tts: TtsArgs,
+        #[command(flatten)]
+        director: DirectorArgs,
     },
     /// Bake-off: fixed A/B samples (plain vs directed) with timing and peak GPU memory
     Bench {
@@ -172,6 +209,35 @@ fn main() -> Result<()> {
             out,
             plain,
         } => narrate(&file, &tts, &director, &out, plain),
+        Cmd::Work {
+            url,
+            user,
+            api_password,
+            labels,
+            done_label,
+            max,
+            out,
+            public_url,
+            feed_title,
+            bitrate,
+            dry_run,
+            tts,
+            director,
+        } => work(
+            &WorkOpts {
+                labels,
+                done_label,
+                max,
+                out,
+                public_url,
+                feed_title,
+                bitrate,
+                dry_run,
+            },
+            FreshRss::new(&url, &user, &api_password),
+            &tts,
+            &director,
+        ),
         Cmd::Bench { tts, director, out } => run_bench(&tts, &director, &out),
     }
 }
@@ -292,19 +358,17 @@ fn narrate(file: &str, tts: &TtsArgs, d: &DirectorArgs, out: &Path, plain: bool)
         eprintln!("# no director: neutral narration");
     }
     let vram = bench::VramSampler::start();
-    let res = pipeline::narrate(
-        &sentences,
+    let name = out
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let res = narrate_story(
         &mut engine,
+        &sentences,
         llm.as_ref().map(|c| c as &dyn Completer),
         &d.options(),
         out,
-    )?;
-    // Read-along data next to the audio: sentence times for the player page.
-    let timings_path = out.with_extension("timings.json");
-    let audio_name = out.file_name().map(|n| n.to_string_lossy().into_owned());
-    std::fs::write(
-        &timings_path,
-        serde_json::to_string_pretty(&json!({"audio": audio_name, "sentences": res.timings}))?,
+        &name,
     )?;
     println!(
         "{}: {:.1} s of audio in {:.1} s (RTF {:.2}), {} generations, {} LLM fixes; peak GPU {}",
@@ -317,6 +381,163 @@ fn narrate(file: &str, tts: &TtsArgs, d: &DirectorArgs, out: &Path, plain: bool)
         vram.stop().map_or("unknown".into(), |m| format!("{m} MiB")),
     );
     Ok(())
+}
+
+/// Narrate `sentences` to `out_wav` and write the read-along data (`.timings.json`) next to it.
+/// `audio_name` is the file the timings refer to (the WAV may be replaced by an encoded copy).
+fn narrate_story(
+    engine: &mut Maya1LlamaCpp,
+    sentences: &[Sentence],
+    llm: Option<&dyn Completer>,
+    opts: &PlanOptions,
+    out_wav: &Path,
+    audio_name: &str,
+) -> Result<pipeline::Narrated> {
+    let res = pipeline::narrate(sentences, engine, llm, opts, out_wav)?;
+    std::fs::write(
+        out_wav.with_extension("timings.json"),
+        serde_json::to_string_pretty(&json!({"audio": audio_name, "sentences": res.timings}))?,
+    )?;
+    Ok(res)
+}
+
+struct WorkOpts {
+    labels: Vec<String>,
+    done_label: String,
+    max: usize,
+    out: PathBuf,
+    public_url: String,
+    feed_title: String,
+    bitrate: String,
+    dry_run: bool,
+}
+
+fn work(w: &WorkOpts, mut fr: FreshRss, tts: &TtsArgs, d: &DirectorArgs) -> Result<()> {
+    fr.login()?;
+    let labels = if w.labels.is_empty() {
+        vec!["narrate".to_string(), "narrate-scary".to_string()]
+    } else {
+        w.labels.clone()
+    };
+    let mut todo = Vec::new();
+    for label in &labels {
+        for e in fr.label_entries(label, w.max.max(10))? {
+            if !todo
+                .iter()
+                .any(|(_, t): &(String, freshrss_tts::freshrss::Entry)| t.id == e.id)
+            {
+                todo.push((label.clone(), e));
+            }
+        }
+    }
+    let (new, finished): (Vec<_>, Vec<_>) = todo.into_iter().partition(|(_, e)| {
+        !w.out
+            .join(format!("{}{}", worker::slug(&e.id), worker::EPISODE_SUFFIX))
+            .exists()
+    });
+    println!(
+        "{} stories to narrate (at most {} now), {} already narrated but still labelled",
+        new.len(),
+        w.max,
+        finished.len()
+    );
+    if w.dry_run {
+        for (label, e) in new.iter().take(w.max) {
+            println!(
+                "  would narrate [{label}] {:?} -> {}.opus",
+                e.title,
+                worker::slug(&e.id)
+            );
+        }
+        for (label, e) in &finished {
+            println!("  would relabel [{label}] {:?}", e.title);
+        }
+        return Ok(());
+    }
+    std::fs::create_dir_all(&w.out)?;
+    // A previous run narrated these but could not relabel them.
+    for (label, e) in &finished {
+        relabel(&mut fr, w, label, e);
+    }
+    if !new.is_empty() {
+        let mut engine = tts.engine()?;
+        let llm = d.client();
+        for (label, e) in new.iter().take(w.max) {
+            match narrate_entry(
+                w,
+                &mut engine,
+                llm.as_ref().map(|c| c as &dyn Completer),
+                d,
+                label,
+                e,
+            ) {
+                Ok(ep) => {
+                    println!(
+                        "narrated {:?}: {:.0} s, {} bytes",
+                        e.title, ep.duration_s, ep.audio_bytes
+                    );
+                    relabel(&mut fr, w, label, e);
+                }
+                Err(err) => eprintln!("could not narrate {:?}: {err:#}", e.title),
+            }
+        }
+    }
+    let episodes = worker::load_episodes(&w.out)?;
+    std::fs::write(
+        w.out.join("feed.xml"),
+        worker::render_feed(&w.feed_title, &w.public_url, &episodes),
+    )?;
+    println!("feed.xml: {} episodes", episodes.len());
+    Ok(())
+}
+
+/// Swap the narrate label for the done label. Failing is not fatal: the episode file exists, so the
+/// next run only retries this step.
+fn relabel(fr: &mut FreshRss, w: &WorkOpts, label: &str, e: &freshrss_tts::freshrss::Entry) {
+    if let Err(err) = fr.edit_labels(std::slice::from_ref(&e.id), &[w.done_label.as_str()], &[label]) {
+        eprintln!("could not relabel {:?}: {err:#}", e.title);
+    }
+}
+
+fn narrate_entry(
+    w: &WorkOpts,
+    engine: &mut Maya1LlamaCpp,
+    llm: Option<&dyn Completer>,
+    d: &DirectorArgs,
+    label: &str,
+    e: &freshrss_tts::freshrss::Entry,
+) -> Result<Episode> {
+    let sentences = pipeline::prepare(&e.html);
+    if sentences.is_empty() {
+        bail!("the story has no text");
+    }
+    let slug = worker::slug(&e.id);
+    let mut opts = d.options();
+    if label == "narrate-scary" && opts.hint.is_none() {
+        opts.hint = Some("a scary story: build dread, hushed delivery in tense moments".into());
+    }
+    let wav = w.out.join(format!("{slug}.wav"));
+    let audio_file = format!("{slug}.opus");
+    let res = narrate_story(engine, &sentences, llm, &opts, &wav, &audio_file)?;
+    let opus = w.out.join(&audio_file);
+    freshrss_tts::audio::encode(&wav, &opus, &w.bitrate)?;
+    std::fs::remove_file(&wav)?;
+    let ep = Episode {
+        slug: slug.clone(),
+        title: e.title.clone(),
+        url: e.url.clone(),
+        source: e.feed.clone(),
+        published: e.published,
+        audio_file,
+        audio_bytes: std::fs::metadata(&opus)?.len(),
+        duration_s: res.audio_seconds,
+    };
+    // written last: its presence means the story is done
+    std::fs::write(
+        w.out.join(format!("{slug}{}", worker::EPISODE_SUFFIX)),
+        serde_json::to_string_pretty(&ep)?,
+    )?;
+    Ok(ep)
 }
 
 fn run_bench(tts: &TtsArgs, d: &DirectorArgs, out: &Path) -> Result<()> {

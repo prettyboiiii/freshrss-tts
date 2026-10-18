@@ -3,7 +3,7 @@
 ## Goals and constraints
 
 - Uncapped, local narration of FreshRSS stories with real emotional range (scary stories are the test).
-- Hardware: debian node, i7-7700HQ (4C/8T), 35 GB RAM, GTX 1050 with 4 GB VRAM (Pascal, driver 550).
+- Hardware: debian node, i7-7700HQ (4C/8T), 35 GB RAM, GTX 1050 with 4 GB VRAM (Pascal). The host needs NVIDIA driver 580 or newer: 550 only supports CUDA 12.4, and the CUDA 12.8 llama.cpp image needs 12.8.
 - Batch is fine. Real-time is not required.
 - Rust, no Python in the product.
 
@@ -26,10 +26,20 @@
    Mood becomes words in the voice description (`<description="...">`); whisper/raised become inline
    `<whisper>`/`<angry>` tags; beats become `<gasp>` etc. A pause of 600 ms or more ends a generation so
    the silence is real.
+   - Quoted speech: the director may name a `speaker` (a voice description of identity only, such as
+     "boy, about 12, higher pitch") for a sentence with quotes; those spans are generated in that voice.
+     Quotes the narrator speaks (`I told him, "..."`) always stay in the narrator's voice (code rule).
+   - Maya1 cannot clone a voice, so every generation of one voice uses the same sampling seed
+     (`voice_seed`) to keep it steadier across chunks. This helps but does not remove drift.
+   - Pauses: defaults come from punctuation (250 ms sentence end, 350 ms `?`/`!`, 500 ms ellipsis, 900 ms
+     paragraph end). Gaps inside one generation are the model's own. Dramatic pauses (1100 ms or more) are
+     kept rare in code.
 5. **Synthesise** (`engines::maya1_llamacpp`): prompt token ids go to `llama-server /completion` (GGUF on
    the GPU), tokens stream back until the end-of-speech token, 7-token frames are unpacked into the three
    SNAC levels and decoded to 24 kHz audio by candle on the CPU.
-6. **Assemble** (`audio`): join chunks with silences, write WAV (ffmpeg encoding to mp3/opus exists in
+6. **Assemble** (`audio`): trim dead air at the edges of each chunk, join with silences, write WAV and a
+   `.timings.json` (sentence start/end, estimated inside a chunk) that the output page uses for a
+   read-along (ffmpeg encoding to mp3/opus exists in
    `audio::encode`, not yet wired into a worker).
 
 ## What is verified, and how
@@ -43,20 +53,25 @@
 | llama-server client | Tests against a mock built from llama.cpp's documented API |
 | FreshRSS client | Tests against a mock built from reading FreshRSS's `greader.php` |
 | CLI wiring | Tests that run the binary against mocks, SNAC directory fabricated |
+| Maya1 GGUF runs on the GTX 1050 (llama.cpp `server-cuda`, CUDA 12.8, driver 580.178.04) | Live run in the cluster: about 21 tokens/s, about 2.7 GB VRAM, no truncation in `bench` |
+| Emotion tags exist in the GGUF | `tags` probe against the live server |
+| Real SNAC weights decode to audio, real llama-server streaming (`return_tokens`) | Full stories narrated end to end |
+| FreshRSS login, label listing, story fetch (`check`) | Run against the real instance; the API password lives in a SOPS secret |
+| Reddit "submitted by" footer is dropped, quotes split into spans | Unit tests plus a real story |
+| Speed | Whole story: real-time factor about 6-9 including about 4 minutes of CPU director time (generation dominates; SNAC decode does not) |
+| Voice and pacing quality | The user listened to full stories: "pretty good, not perfect" after the seed, pause and narrator-quote fixes |
 
-## What is NOT verified (the bake-off decides these)
+## What is NOT verified
 
-- Maya1 quality on a story: tag adherence, whether mood descriptions change delivery, **voice drift
-  between generations**, long-form stability.
-- Speed and VRAM of Maya1 Q4 on the GTX 1050 (arithmetic suggests 2-3x slower than real time).
+- Voice drift between generations is reduced but not gone, and character voices can still sound
+  different from one line to the next. Judged by ear only.
 - Whether 4-bit quantization hurts audio quality (compare Q4 with a larger quant).
-- Real SNAC weights (`lmz/candle-snac`) loading and sounding right.
-- SNAC CPU decode speed on your CPU: about 1.1-1.5x real time on a 4 vCPU Xeon in this project's tests
-  (`cargo test --release -- --ignored --nocapture snac_cpu_decode_speed` measures yours). It may
-  dominate total time; options are overlapping it with generation, or running it on the GPU.
-- Real llama-server streaming (`tokens` field with `return_tokens`), real FreshRSS (`edit-tag` creating
-  a missing label, id formats). `freshrss-tts check` is the live test for FreshRSS.
-- Quality of a 3-4B director LLM's choices.
+- Whether llama-server flags (`-np 1`, flash attention, KV quantisation) raise tokens/s. GPU temperature
+  reached 87 C under load.
+- The 3-4B director's judgement is mediocre: it rarely uses whisper or beats and sometimes mislabels
+  speakers. Code rules (narrator quotes, rare long pauses) cover the worst cases.
+- FreshRSS `edit-tag` creating a missing label and the label id formats (needed by the worker).
+- The worker, podcast feed and scale-to-zero are not built yet.
 
 ## Decisions and alternatives
 

@@ -426,6 +426,7 @@ fn narrate(file: &str, tts: &TtsArgs, d: &DirectorArgs, out: &Path, plain: bool)
         &d.options(),
         out,
         &name,
+        &mut |_, _| Ok(()),
     )?;
     println!(
         "{}: {:.1} s of audio in {:.1} s (RTF {:.2}), {} generations, {} LLM fixes; peak GPU {}",
@@ -449,8 +450,9 @@ fn narrate_story(
     opts: &PlanOptions,
     out_wav: &Path,
     audio_name: &str,
+    progress: &mut dyn FnMut(usize, usize) -> Result<()>,
 ) -> Result<pipeline::Narrated> {
-    let res = pipeline::narrate(sentences, engine, llm, opts, out_wav)?;
+    let res = pipeline::narrate(sentences, engine, llm, opts, out_wav, progress)?;
     std::fs::write(
         out_wav.with_extension("timings.json"),
         serde_json::to_string_pretty(&json!({"audio": audio_name, "sentences": res.timings}))?,
@@ -500,6 +502,8 @@ fn work(w: &WorkOpts, mut fr: FreshRss, tts: &TtsArgs, d: &DirectorArgs) -> Resu
         return Ok(());
     }
     std::fs::create_dir_all(&w.out)?;
+    // A cancel request from before this pass has already removed its labels (see worker::CANCEL_FILE).
+    let _ = std::fs::remove_file(w.out.join(worker::CANCEL_FILE));
     // A previous run narrated these but could not relabel them.
     for (label, e) in &finished {
         relabel(&mut fr, e, label, &w.done_label);
@@ -512,15 +516,38 @@ fn work(w: &WorkOpts, mut fr: FreshRss, tts: &TtsArgs, d: &DirectorArgs) -> Resu
         worker::wait_ready(&servers, std::time::Duration::from_secs(w.ready_timeout))?;
         let mut engine = tts.engine()?;
         let llm = d.client();
+        let mut status = worker::Status::new(
+            &w.out,
+            new.iter()
+                .take(w.max)
+                .map(|(_, e)| worker::Job {
+                    slug: worker::slug(&e.id),
+                    title: e.title.clone(),
+                    source: e.feed.clone(),
+                    done: 0,
+                    total: 0,
+                })
+                .collect(),
+        );
         for (label, e) in new.iter().take(w.max) {
-            match narrate_entry(
+            let result = narrate_entry(
                 w,
                 &mut engine,
                 llm.as_ref().map(|c| c as &dyn Completer),
                 d,
                 label,
                 e,
-            ) {
+                &mut status,
+            );
+            status.remove(&worker::slug(&e.id));
+            if result.is_err() && w.out.join(worker::CANCEL_FILE).exists() {
+                // Cancelled from the web UI, which also took the labels off the whole queue: no relabel, no
+                // notification, and the stories after this one stay un-narrated.
+                eprintln!("cancelled while narrating {:?}", e.title);
+                let _ = std::fs::remove_file(w.out.join(worker::CANCEL_FILE));
+                break;
+            }
+            match result {
                 Ok(ep) => {
                     println!(
                         "narrated {:?}: {:.0} s, {} bytes",
@@ -644,6 +671,7 @@ fn narrate_entry(
     d: &DirectorArgs,
     label: &str,
     e: &freshrss_tts::freshrss::Entry,
+    status: &mut worker::Status,
 ) -> Result<Episode> {
     let sentences = pipeline::prepare(&e.html);
     if sentences.is_empty() {
@@ -656,7 +684,21 @@ fn narrate_entry(
     }
     let wav = w.out.join(format!("{slug}.wav"));
     let audio_file = format!("{slug}.opus");
-    let res = narrate_story(engine, &sentences, llm, &opts, &wav, &audio_file)?;
+    let res = narrate_story(
+        engine,
+        &sentences,
+        llm,
+        &opts,
+        &wav,
+        &audio_file,
+        &mut |done, total| {
+            status.progress(&slug, done, total);
+            if w.out.join(worker::CANCEL_FILE).exists() {
+                bail!("cancelled");
+            }
+            Ok(())
+        },
+    )?;
     let opus = w.out.join(&audio_file);
     freshrss_tts::audio::encode(&wav, &opus, &w.bitrate)?;
     std::fs::remove_file(&wav)?;

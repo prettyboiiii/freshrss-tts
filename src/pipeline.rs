@@ -76,19 +76,22 @@ pub fn timings(segments: &[Segment], chunks: &[Chunk], speech_s: &[f64]) -> Vec<
         .collect()
 }
 
-/// Direct, render and synthesise a whole story into `out_wav`.
+/// Direct, render and synthesise a whole story into `out_wav`. `progress(done, total)` is called with
+/// the chunk count before the first chunk and after each one; an error from it aborts the story.
 pub fn narrate(
     sentences: &[Sentence],
     engine: &mut dyn Engine,
     llm: Option<&dyn Completer>,
     opts: &PlanOptions,
     out_wav: &Path,
+    progress: &mut dyn FnMut(usize, usize) -> Result<()>,
 ) -> Result<Narrated> {
     let t0 = Instant::now();
     let (plan, chunks) = direct_and_render(sentences, llm, opts, maya1::DEFAULT_MAX_CHARS);
     let sr = engine.sample_rate();
     let mut parts = Vec::with_capacity(chunks.len());
     let mut speech_s = Vec::with_capacity(chunks.len());
+    progress(0, chunks.len())?;
     for (n, chunk) in chunks.iter().enumerate() {
         eprintln!(
             "synth {}/{} ({} chars)",
@@ -99,6 +102,7 @@ pub fn narrate(
         let pcm = engine.synth(chunk)?;
         speech_s.push(audio::duration_s(audio::trim_silence(&pcm, sr), sr));
         parts.push((pcm, chunk.pause_ms));
+        progress(n + 1, chunks.len())?;
     }
     let pcm = audio::join(parts, sr);
     audio::write_wav(out_wav, &pcm, sr)?;

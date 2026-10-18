@@ -37,7 +37,7 @@ fn generation_streams_tokens_and_stops_at_end_of_speech() {
     let speech = speech_tokens(3);
     let server = llama_mock(speech.clone());
     let engine = Maya1LlamaCpp::new(&server.url, Box::new(FakeDecoder(Default::default())));
-    let (tokens, stats) = engine.generate_tokens(&[7, 8, 9]).unwrap();
+    let (tokens, stats) = engine.generate_tokens(&[7, 8, 9], None).unwrap();
     assert_eq!(
         tokens, speech,
         "tokens after the end-of-speech token must be dropped"
@@ -55,6 +55,12 @@ fn generation_streams_tokens_and_stops_at_end_of_speech() {
     );
     assert_eq!(body["temperature"], 0.4);
     assert!(body.get("seed").is_none());
+
+    // a chunk's voice seed is used unless the engine was given an explicit one
+    let server = llama_mock(speech_tokens(1));
+    let engine = Maya1LlamaCpp::new(&server.url, Box::new(FakeDecoder(Default::default())));
+    engine.generate_tokens(&[1], Some(7)).unwrap();
+    assert_eq!(server.requests()[0].json()["seed"], 7);
 }
 
 #[test]
@@ -68,7 +74,7 @@ fn truncation_is_reported_when_the_budget_runs_out() {
     let mut engine = Maya1LlamaCpp::new(&server.url, Box::new(FakeDecoder(Default::default())));
     engine.n_predict = 2;
     engine.sampling.seed = Some(42);
-    let (tokens, stats) = engine.generate_tokens(&[1]).unwrap();
+    let (tokens, stats) = engine.generate_tokens(&[1], None).unwrap();
     assert_eq!(tokens.len(), 2);
     assert!(stats.truncated);
     assert_eq!(server.requests()[0].json()["seed"], 42);
@@ -83,6 +89,7 @@ fn synth_builds_the_prompt_unpacks_frames_and_decodes() {
         text: "<whisper> Don't look.".into(),
         style: "Old man, low".into(),
         pause_ms: 250,
+        seed: None,
         parts: Vec::new(),
     };
     let pcm = engine.synth(&chunk).unwrap();

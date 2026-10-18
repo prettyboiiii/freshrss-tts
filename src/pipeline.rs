@@ -136,6 +136,7 @@ mod tests {
             text: String::new(),
             style: String::new(),
             pause_ms,
+            seed: None,
             parts: parts.to_vec(),
         }
     }

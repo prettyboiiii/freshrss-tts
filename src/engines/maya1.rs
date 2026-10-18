@@ -28,7 +28,7 @@ pub const SAMPLES_PER_FRAME: usize = 2048;
 
 pub const DEFAULT_MAX_CHARS: usize = 300; // ~20 s of speech; one generation tops out near 25 s at 2048 tokens
 /// A pause at least this long ends a chunk so the silence is real.
-pub const BREAK_PAUSE_MS: u32 = 400;
+pub const BREAK_PAUSE_MS: u32 = 600;
 
 /// Only tags confirmed on the model card / README. The card says "12+ more" exist; add them here
 /// once `freshrss-tts tags` shows they are single tokens in your GGUF.
@@ -92,10 +92,25 @@ pub fn describe(narrator_voice: &str, mood: Mood, delivery: Delivery) -> String 
     parts.join(", ")
 }
 
+/// Maya1 cannot clone a voice, so the same description still lands on a slightly different voice
+/// each time. Sampling every generation of one voice from the same seed makes the start of the
+/// audio (where the voice is decided) repeat, which keeps that voice steadier across chunks.
+pub fn voice_seed(voice: &str) -> i64 {
+    let hash = voice
+        .trim()
+        .to_lowercase()
+        .bytes()
+        .fold(0xcbf29ce484222325u64, |h, b| {
+            (h ^ u64::from(b)).wrapping_mul(0x100000001b3)
+        });
+    (hash & 0x7fff_ffff) as i64
+}
+
 /// Group directed sentences into generations. The text of every sentence is preserved verbatim.
 pub fn render(segments: &[Segment], narrator_voice: &str, max_chars: usize) -> Vec<Chunk> {
     struct Open {
         style: String,
+        seed: i64,
         tag: Option<&'static str>,
         parts: Vec<String>,
         map: Vec<(usize, usize)>,
@@ -115,6 +130,7 @@ pub fn render(segments: &[Segment], narrator_voice: &str, max_chars: usize) -> V
             chunks.push(Chunk {
                 text: text.trim().to_string(),
                 style: o.style,
+                seed: Some(o.seed),
                 pause_ms: o.pause,
                 parts: o.map,
             });
@@ -126,20 +142,21 @@ pub fn render(segments: &[Segment], narrator_voice: &str, max_chars: usize) -> V
         let tag = delivery_tag(d.delivery);
         // One (voice, piece) per run: a character's quoted words get their own voice, everything else
         // (and the narrator's own quotes) the narrator's.
-        let mut pieces: Vec<(String, String)> = Vec::new();
+        let mut pieces: Vec<(String, String, i64)> = Vec::new();
         for span in &seg.spans {
             let voice = match (&seg.speaker, span.quoted) {
                 (Some(who), true) => who.as_str(),
                 _ => narrator_voice,
             };
             let style = describe(voice, d.mood, d.delivery);
+            let seed = voice_seed(voice);
             pieces.extend(
                 split_long(&span.text, max_chars)
                     .into_iter()
-                    .map(|p| (style.clone(), p)),
+                    .map(|p| (style.clone(), p, seed)),
             );
         }
-        for (n, (style, piece)) in pieces.iter().enumerate() {
+        for (n, (style, piece, seed)) in pieces.iter().enumerate() {
             let style = style.clone();
             let last_piece = n == pieces.len() - 1;
             let text = match d.beat.filter(|_| n == 0) {
@@ -155,6 +172,7 @@ pub fn render(segments: &[Segment], narrator_voice: &str, max_chars: usize) -> V
             }
             let o = cur.get_or_insert_with(|| Open {
                 style: style.clone(),
+                seed: *seed,
                 tag,
                 parts: vec![],
                 map: vec![],
@@ -272,6 +290,21 @@ mod tests {
     }
     fn plain(i: usize, text: &str) -> Segment {
         seg(i, text, Directive::default())
+    }
+
+    #[test]
+    fn one_voice_keeps_one_seed_across_moods() {
+        let dread = Directive {
+            mood: Mood::Dread,
+            ..Default::default()
+        };
+        let chunks = render(&[plain(0, "Calm."), seg(1, "Dread now.", dread)], VOICE, 300);
+        assert_eq!(chunks.len(), 2);
+        assert_ne!(chunks[0].style, chunks[1].style);
+        assert_eq!(chunks[0].seed, chunks[1].seed);
+        assert!(chunks[0].seed.is_some_and(|s| s >= 0));
+        assert_ne!(voice_seed("boy, about 12"), voice_seed("old woman, rasping"));
+        assert_eq!(voice_seed("  Boy, about 12 "), voice_seed("boy, about 12"));
     }
 
     #[test]

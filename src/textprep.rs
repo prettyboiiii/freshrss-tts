@@ -46,6 +46,9 @@ static BLANKS: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"[ \t]+").unwrap()
 // Sentence-ending punctuation, optional closing quotes/brackets, then whitespace.
 static BOUNDARY: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#"([.!?]+|\x{2026}+)(["'\x{201d}\x{2019})\]]*)(\s+)"#).unwrap());
+// Reddit RSS entries end with "submitted by /u/name [link] [comments]"; it is not part of the story.
+static REDDIT_FOOTER: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^submitted by\s+/?u/\S+\s+\[link\]\s+\[comments\]$").unwrap());
 static LAST_WORD: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"[A-Za-z][A-Za-z.]*$").unwrap());
 
 /// Strip markup and return paragraphs separated by a blank line.
@@ -128,7 +131,12 @@ pub fn html_to_text(html: &str) -> String {
         }
     }
     flush(&mut text, &mut out, skip_depth);
-    normalize_text(&out)
+    let text = normalize_text(&out);
+    match text.rsplit_once("\n\n") {
+        Some((body, last)) if REDDIT_FOOTER.is_match(last) => body.to_string(),
+        None if REDDIT_FOOTER.is_match(&text) => String::new(),
+        _ => text,
+    }
 }
 
 /// Collapse whitespace; keep paragraph breaks (blank lines), join soft line breaks.
@@ -278,6 +286,17 @@ mod tests {
         assert_eq!(
             html_to_text(html),
             "Title\n\nFirst para & more.\n\nSecond line.\n\nThird"
+        );
+    }
+
+    #[test]
+    fn reddit_footer_is_dropped() {
+        let html = "<p>It happened.</p><p>Then it stopped.</p> &#32; submitted by &#32; <a href=\"x\">/u/Some_User</a> <a href=\"y\">[link]</a> <a href=\"z\">[comments]</a>";
+        assert_eq!(html_to_text(html), "It happened.\n\nThen it stopped.");
+        assert_eq!(html_to_text("submitted by /u/x [link] [comments]"), "");
+        assert_eq!(
+            html_to_text("<p>I was submitted by mistake.</p>"),
+            "I was submitted by mistake."
         );
     }
 

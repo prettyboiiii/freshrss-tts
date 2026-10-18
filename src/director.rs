@@ -427,8 +427,10 @@ impl Default for PlanOptions {
         Self {
             hint: None,
             narrator_voice: None,
-            window_chars: 5000,
-            window_sentences: 120,
+            // Small windows: on a CPU the director answers at ~2.5 tokens/s, so one request per ~2500
+            // characters keeps each answer to a few minutes instead of a quarter of an hour.
+            window_chars: 2500,
+            window_sentences: 60,
         }
     }
 }

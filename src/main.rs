@@ -215,7 +215,8 @@ fn plan(file: &str, d: &DirectorArgs, as_json: bool) -> Result<()> {
             .map(|s| {
                 json!({"idx": s.idx, "text": s.text, "para_start": s.para_start,
                     "mood": s.directive.mood.as_str(), "delivery": s.directive.delivery.as_str(),
-                    "beat": s.directive.beat.map(|b| b.as_str()), "pause_ms": s.directive.pause_ms})
+                    "beat": s.directive.beat.map(|b| b.as_str()), "pause_ms": s.directive.pause_ms,
+                    "speaker": s.speaker})
             })
             .collect();
         println!(

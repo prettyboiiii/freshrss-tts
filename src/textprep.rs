@@ -168,11 +168,75 @@ pub fn normalize_text(text: &str) -> String {
     paragraphs.join("\n\n")
 }
 
+/// A run of a sentence that is either inside quotation marks (spoken by a character) or not.
+/// The quote marks stay in the span, so concatenating the spans gives back the sentence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Span {
+    pub text: String,
+    pub quoted: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Sentence {
     pub idx: usize,
     pub text: String,
     pub para_start: bool,
+    pub spans: Vec<Span>,
+    /// The sentence starts inside a quote opened in an earlier sentence.
+    pub continues_quote: bool,
+}
+
+/// Closing mark of the quote opened by `c`, if `c` opens one. A single quote opens only at the start
+/// of a word, so apostrophes ("don't", "dogs'") never do.
+fn closer_for(c: char, prev: Option<char>, next: Option<char>) -> Option<char> {
+    let word_start = !prev.is_some_and(char::is_alphanumeric) && next.is_some_and(char::is_alphanumeric);
+    match c {
+        '"' => Some('"'),
+        '\u{201c}' => Some('\u{201d}'),
+        '\'' if word_start => Some('\''),
+        '\u{2018}' if word_start => Some('\u{2019}'),
+        _ => None,
+    }
+}
+
+/// Split one sentence into quoted and unquoted spans. `open` is the closing mark we are waiting for
+/// (carried between the sentences of a paragraph).
+pub fn split_quotes(text: &str, open: &mut Option<char>) -> Vec<Span> {
+    let chars: Vec<char> = text.chars().collect();
+    let mut spans: Vec<Span> = Vec::new();
+    let mut cur = String::new();
+    let push = |cur: &mut String, quoted: bool, spans: &mut Vec<Span>| {
+        if !cur.trim().is_empty() {
+            spans.push(Span {
+                text: cur.trim().to_string(),
+                quoted,
+            });
+        }
+        cur.clear();
+    };
+    for (i, &c) in chars.iter().enumerate() {
+        let (prev, next) = (i.checked_sub(1).map(|p| chars[p]), chars.get(i + 1).copied());
+        match *open {
+            None => {
+                if let Some(close) = closer_for(c, prev, next) {
+                    push(&mut cur, false, &mut spans);
+                    *open = Some(close);
+                }
+                cur.push(c);
+            }
+            Some(close) => {
+                cur.push(c);
+                // A closing single quote must not be followed by a letter ("don't" inside quotes).
+                let single = close == '\'' || close == '\u{2019}';
+                if c == close && !(single && next.is_some_and(char::is_alphanumeric)) {
+                    push(&mut cur, true, &mut spans);
+                    *open = None;
+                }
+            }
+        }
+    }
+    push(&mut cur, open.is_some(), &mut spans);
+    spans
 }
 
 fn starts_sentence(ch: char) -> bool {
@@ -214,11 +278,15 @@ fn split_paragraph(par: &str) -> Vec<String> {
 pub fn split_sentences(text: &str) -> Vec<Sentence> {
     let mut sentences = Vec::new();
     for par in normalize_text(text).split("\n\n").filter(|p| !p.is_empty()) {
+        let mut open = None; // an unclosed quote never leaks into the next paragraph
         for (n, s) in split_paragraph(par).into_iter().enumerate() {
+            let continues_quote = open.is_some();
             sentences.push(Sentence {
                 idx: sentences.len(),
+                spans: split_quotes(&s, &mut open),
                 text: s,
                 para_start: n == 0,
+                continues_quote,
             });
         }
     }
@@ -287,6 +355,62 @@ mod tests {
             html_to_text(html),
             "Title\n\nFirst para & more.\n\nSecond line.\n\nThird"
         );
+    }
+
+    fn spans(s: &str) -> Vec<(String, bool)> {
+        split_quotes(s, &mut None)
+            .into_iter()
+            .map(|p| (p.text, p.quoted))
+            .collect()
+    }
+
+    #[test]
+    fn quotes_split_into_spans() {
+        assert_eq!(
+            spans("He said, \"Run now!\" and left."),
+            [
+                ("He said,".into(), false),
+                ("\"Run now!\"".into(), true),
+                ("and left.".into(), false)
+            ]
+        );
+        assert_eq!(spans("No quotes here."), [("No quotes here.".into(), false)]);
+        assert_eq!(
+            spans("\u{201c}Hi,\u{201d} she said."),
+            [("\u{201c}Hi,\u{201d}".into(), true), ("she said.".into(), false)]
+        );
+    }
+
+    #[test]
+    fn single_quotes_ignore_apostrophes() {
+        assert_eq!(
+            spans("It's the dogs' bowl, and he said 'don't go' twice."),
+            [
+                ("It's the dogs' bowl, and he said".into(), false),
+                ("'don't go'".into(), true),
+                ("twice.".into(), false)
+            ]
+        );
+    }
+
+    #[test]
+    fn quote_carries_across_sentences_but_not_paragraphs() {
+        let s = split_sentences(
+            "He asked, \"Who is that? In the kitchen.\" Then he ran.\n\nA \"loose quote. Next.",
+        );
+        let flags: Vec<_> = s.iter().map(|x| x.continues_quote).collect();
+        assert_eq!(flags, [false, true, false, false, true]);
+        assert_eq!(
+            s[0].spans.iter().map(|p| p.quoted).collect::<Vec<_>>(),
+            [false, true]
+        );
+        assert_eq!(s[1].spans.iter().map(|p| p.quoted).collect::<Vec<_>>(), [true]);
+        assert_eq!(s[2].spans.iter().map(|p| p.quoted).collect::<Vec<_>>(), [false]);
+        // joining the spans gives the sentence back (modulo whitespace)
+        for x in &s {
+            let joined: Vec<_> = x.spans.iter().map(|p| p.text.as_str()).collect();
+            assert_eq!(joined.join(" "), x.text);
+        }
     }
 
     #[test]

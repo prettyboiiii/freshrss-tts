@@ -54,10 +54,10 @@ fn plan_without_an_llm_prints_plain_chunks() {
     let dir = tempfile::tempdir().unwrap();
     let o = run(&["plan", &story_file(dir.path())]);
     assert!(o.status.success(), "{}", err(&o));
-    // one generation per paragraph: the 700 ms paragraph pause ends a chunk so the silence is real
+    // one generation per paragraph: the 450 ms paragraph pause ends a chunk so the silence is real
     assert!(out(&o).contains("4 sentences -> 3 generations"), "{}", out(&o));
     assert!(
-        out(&o).contains("\"Don't go in,\" she whispered. I went in anyway.\n    (+700 ms)"),
+        out(&o).contains("\"Don't go in,\" she whispered. I went in anyway.\n    (+450 ms)"),
         "{}",
         out(&o)
     );

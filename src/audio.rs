@@ -8,11 +8,31 @@ pub fn silence(ms: u32, sample_rate: u32) -> Vec<u8> {
     vec![0u8; 2 * (sample_rate as usize * ms as usize / 1000)]
 }
 
-/// `parts` is (pcm, pause_ms_after) per chunk.
+/// Samples quieter than this (about -40 dBFS) count as silence when trimming chunk edges.
+const SILENCE_LEVEL: i16 = 330;
+/// Quiet audio kept next to the speech so word endings do not get clipped.
+const TRIM_MARGIN_MS: usize = 40;
+
+/// Cut the dead air a TTS leaves before and after speech, so the pauses in a story are the ones
+/// the director asked for. A chunk that is all silence becomes empty.
+pub fn trim_silence(pcm: &[u8], sample_rate: u32) -> &[u8] {
+    let loud = |s: &[u8; 2]| i16::from_le_bytes(*s).saturating_abs() >= SILENCE_LEVEL;
+    let (samples, _) = pcm.as_chunks::<2>();
+    let Some(first) = samples.iter().position(loud) else {
+        return &[];
+    };
+    let last = samples.iter().rposition(loud).unwrap_or(first);
+    let margin = sample_rate as usize * TRIM_MARGIN_MS / 1000;
+    let start = first.saturating_sub(margin);
+    let end = (last + 1 + margin).min(pcm.len() / 2);
+    &pcm[2 * start..2 * end]
+}
+
+/// `parts` is (pcm, pause_ms_after) per chunk. Each chunk is trimmed of leading/trailing silence.
 pub fn join<I: IntoIterator<Item = (Vec<u8>, u32)>>(parts: I, sample_rate: u32) -> Vec<u8> {
     let mut out = Vec::new();
     for (pcm, pause_ms) in parts {
-        out.extend(pcm);
+        out.extend(trim_silence(&pcm, sample_rate));
         out.extend(silence(pause_ms, sample_rate));
     }
     out
@@ -81,8 +101,21 @@ mod tests {
     #[test]
     fn silence_and_join_lengths() {
         assert_eq!(silence(500, 8000).len(), 2 * 4000);
-        let pcm = join([([1u8, 0].repeat(8000), 500), ([2u8, 0].repeat(8000), 0)], 8000);
+        let loud = |v: i16| v.to_le_bytes().repeat(8000);
+        let pcm = join([(loud(1000), 500), (loud(2000), 0)], 8000);
         assert_eq!(duration_s(&pcm, 8000), 2.5);
+    }
+
+    #[test]
+    fn trim_cuts_dead_air_but_keeps_a_margin() {
+        let sr = 8000; // margin = 40 ms = 320 samples
+        let mut pcm = vec![0u8; 2 * 4000]; // 0.5 s of silence
+        pcm.extend(1000i16.to_le_bytes().repeat(800)); // 0.1 s of speech
+        pcm.extend(vec![0u8; 2 * 4000]);
+        let trimmed = trim_silence(&pcm, sr);
+        assert_eq!(trimmed.len() / 2, 800 + 2 * 320);
+        assert!(trim_silence(&[0u8; 100], sr).is_empty());
+        assert!(trim_silence(&[], sr).is_empty());
     }
 
     #[test]

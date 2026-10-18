@@ -11,7 +11,7 @@ use serde::Serialize;
 use serde_json::{json, Map, Value};
 use std::collections::HashMap;
 
-use crate::textprep::Sentence;
+use crate::textprep::{Sentence, Span};
 
 macro_rules! vocab {
     ($(#[$m:meta])* $name:ident { $($var:ident = $s:literal),+ $(,)? }) => {
@@ -42,7 +42,8 @@ vocab!(
 );
 
 pub const DEFAULT_NARRATOR: &str = "Adult male narrator, deep warm voice, measured storytelling pace";
-pub const MAX_PAUSE_MS: u32 = 4000;
+pub const MAX_PAUSE_MS: u32 = 1500;
+const MAX_SPEAKER_CHARS: usize = 200;
 
 /// How one sentence is performed. `mood` and `delivery` persist; `beat` and `pause_ms` do not.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -71,6 +72,10 @@ pub struct Segment {
     pub text: String,
     pub para_start: bool,
     pub directive: Directive,
+    /// Quoted and unquoted runs of `text`, in order.
+    pub spans: Vec<Span>,
+    /// Voice of the character whose quoted words are in `spans`; None = the narrator speaks them.
+    pub speaker: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -112,6 +117,7 @@ pub fn director_schema() -> Value {
                         "delivery": {"type": "string", "enum": deliveries},
                         "beat": {"type": "string", "enum": beats},
                         "pause_ms": {"type": "integer"},
+                        "speaker": {"type": "string"},
                     },
                     "required": ["i"],
                 },
@@ -140,8 +146,13 @@ after a scare.\n\
 dread, a character whispering). \"raised\" is for shouting.\n\
   - beat: none, {beats}. A short non-verbal sound spoken BEFORE that one sentence. Use rarely, only \
 when the text implies the sound.\n\
-  - pause_ms: silence after that one sentence, 0-{max_pause}, in steps of 100. Longer (800-2000) before \
-a reveal or after a scare.\n\
+  - pause_ms: silence after that one sentence, 0-{max_pause}, in steps of 100. The default is already \
+right for most sentences; set it only for a few key moments (800-{max_pause} before a reveal or after \
+a scare), never as a steady ramp.\n\
+  - speaker: for a sentence that contains words in quotation marks spoken by a character OTHER than the \
+narrator: a short voice description of that character (gender, age, pitch, manner, e.g. \"young boy, \
+scared, higher pitch\"). Use exactly the same description every time that character speaks. Omit it for \
+the narrator's own quoted words and for sentences without quotes.\n\
 Sentence numbers must come from the list. Never invent text.",
         moods = join_vocab(Mood::ALL, Mood::as_str),
         deliveries = join_vocab(Delivery::ALL, Delivery::as_str),
@@ -225,16 +236,16 @@ fn loads(raw: &str) -> Option<Map<String, Value>> {
 
 pub fn default_pause_ms(text: &str, last_in_paragraph: bool) -> u32 {
     if last_in_paragraph {
-        700
+        450
     } else if text.ends_with('\u{2026}') || text.ends_with("...") {
-        500
+        300
     } else if text
         .trim_end_matches(['"', '\'', '\u{201d}', '\u{2019}', ')'])
         .ends_with(['?', '!'])
     {
-        350
+        200
     } else {
-        250
+        120
     }
 }
 
@@ -281,6 +292,7 @@ pub fn resolve(sentences: &[Sentence], raw: Option<&str>, state: Directive) -> R
     }
 
     let (mut mood, mut delivery) = (state.mood, state.delivery);
+    let mut speaker: Option<String> = None;
     let mut segments = Vec::with_capacity(sentences.len());
     for (pos, s) in sentences.iter().enumerate() {
         let empty = Map::new();
@@ -322,6 +334,14 @@ pub fn resolve(sentences: &[Sentence], raw: Option<&str>, state: Directive) -> R
                 None => repaired += 1,
             }
         }
+        // A character's voice is only meaningful for sentences with quoted words; a quote that runs
+        // over several sentences keeps its speaker.
+        let has_quote = s.spans.iter().any(|p| p.quoted);
+        speaker = match ev.get("speaker").and_then(Value::as_str).map(str::trim) {
+            Some(v) if has_quote && !v.is_empty() => Some(v.chars().take(MAX_SPEAKER_CHARS).collect()),
+            _ if has_quote && s.continues_quote => speaker.take(),
+            _ => None,
+        };
         segments.push(Segment {
             idx: s.idx,
             text: s.text.clone(),
@@ -332,6 +352,8 @@ pub fn resolve(sentences: &[Sentence], raw: Option<&str>, state: Directive) -> R
                 beat,
                 pause_ms: pause,
             },
+            spans: s.spans.clone(),
+            speaker: speaker.clone(),
         });
     }
     Resolved {
@@ -521,11 +543,27 @@ mod tests {
             &PlanOptions::default(),
         );
         assert_eq!(plan.segments[0].directive.pause_ms, MAX_PAUSE_MS);
-        assert_eq!(plan.segments[1].directive.pause_ms, 700); // last sentence of its paragraph
-        assert_eq!(default_pause_ms("What?", false), 350);
-        assert_eq!(default_pause_ms("He said \"run!\"", false), 350);
-        assert_eq!(default_pause_ms("Wait...", false), 500);
-        assert_eq!(default_pause_ms("Fine.", false), 250);
+        assert_eq!(plan.segments[1].directive.pause_ms, 450); // last sentence of its paragraph
+        assert_eq!(default_pause_ms("What?", false), 200);
+        assert_eq!(default_pause_ms("He said \"run!\"", false), 200);
+        assert_eq!(default_pause_ms("Wait...", false), 300);
+        assert_eq!(default_pause_ms("Fine.", false), 120);
+    }
+
+    #[test]
+    fn speaker_applies_to_quoted_sentences_and_carries_over_a_quote() {
+        let sentences = split_sentences("He asked, \"Who is that? In the kitchen.\" Then he ran. I sat.");
+        // 0: He asked, "Who is that?   1: In the kitchen."   2: Then he ran.   3: I sat.
+        let raw = json!({"narrator_voice": "v", "events": [
+            {"i": 0, "speaker": "young boy, scared"}, {"i": 2, "speaker": "ignored: no quote here"},
+        ]})
+        .to_string();
+        let r = resolve(&sentences, Some(&raw), Directive::default());
+        let who: Vec<_> = r.segments.iter().map(|s| s.speaker.as_deref()).collect();
+        assert_eq!(
+            who,
+            [Some("young boy, scared"), Some("young boy, scared"), None, None]
+        );
     }
 
     #[test]

@@ -28,7 +28,7 @@ pub const SAMPLES_PER_FRAME: usize = 2048;
 
 pub const DEFAULT_MAX_CHARS: usize = 300; // ~20 s of speech; one generation tops out near 25 s at 2048 tokens
 /// A pause at least this long ends a chunk so the silence is real.
-pub const BREAK_PAUSE_MS: u32 = 600;
+pub const BREAK_PAUSE_MS: u32 = 400;
 
 /// Only tags confirmed on the model card / README. The card says "12+ more" exist; add them here
 /// once `freshrss-tts tags` shows they are single tokens in your GGUF.
@@ -121,10 +121,24 @@ pub fn render(segments: &[Segment], narrator_voice: &str, max_chars: usize) -> V
 
     for seg in segments {
         let d = &seg.directive;
-        let style = describe(narrator_voice, d.mood, d.delivery);
         let tag = delivery_tag(d.delivery);
-        let pieces = split_long(&seg.text, max_chars);
-        for (n, piece) in pieces.iter().enumerate() {
+        // One (voice, piece) per run: a character's quoted words get their own voice, everything else
+        // (and the narrator's own quotes) the narrator's.
+        let mut pieces: Vec<(String, String)> = Vec::new();
+        for span in &seg.spans {
+            let voice = match (&seg.speaker, span.quoted) {
+                (Some(who), true) => who.as_str(),
+                _ => narrator_voice,
+            };
+            let style = describe(voice, d.mood, d.delivery);
+            pieces.extend(
+                split_long(&span.text, max_chars)
+                    .into_iter()
+                    .map(|p| (style.clone(), p)),
+            );
+        }
+        for (n, (style, piece)) in pieces.iter().enumerate() {
+            let style = style.clone();
             let last_piece = n == pieces.len() - 1;
             let text = match d.beat.filter(|_| n == 0) {
                 Some(b) => format!("{} {piece}", beat_tag(b)),
@@ -227,7 +241,30 @@ mod tests {
             text: text.into(),
             para_start: false,
             directive: d,
+            spans: crate::textprep::split_quotes(text, &mut None),
+            speaker: None,
         }
+    }
+
+    #[test]
+    fn character_quotes_get_their_own_voice_and_narrator_quotes_do_not() {
+        let mut s = plain(0, "He asked, \"Who is that?\" and froze.");
+        s.speaker = Some("young boy, scared".into());
+        let chunks = render(&[s.clone()], VOICE, DEFAULT_MAX_CHARS);
+        let got: Vec<_> = chunks
+            .iter()
+            .map(|c| (c.text.as_str(), c.style.contains("young boy")))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("He asked,", false),
+                ("\"Who is that?\"", true),
+                ("and froze.", false)
+            ]
+        );
+        s.speaker = None;
+        assert_eq!(render(&[s], VOICE, DEFAULT_MAX_CHARS).len(), 1);
     }
     fn plain(i: usize, text: &str) -> Segment {
         seg(i, text, Directive::default())

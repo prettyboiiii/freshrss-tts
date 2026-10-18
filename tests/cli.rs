@@ -362,7 +362,9 @@ fn work_narrates_encodes_publishes_a_feed_and_relabels() {
     let tts = llama_mock(speech_tokens(2));
     let out_dir = dir.path().join("pod");
     let mut args = work_args(&fr.url, out_dir.to_str().unwrap());
+    let ntfy = MockServer::start(|_| common::Resp::text("{}"));
     args.extend(["--server", &tts.url, "--snac-dir", snac.to_str().unwrap()]);
+    args.extend(["--ntfy-url", &ntfy.url, "--ntfy-token", "tk_secret"]);
 
     let o = run(&args);
     assert!(o.status.success(), "{}", err(&o));

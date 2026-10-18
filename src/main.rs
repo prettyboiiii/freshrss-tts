@@ -94,6 +94,13 @@ enum Cmd {
         /// Keep running: look again every this many seconds instead of exiting after one pass
         #[arg(long)]
         watch: Option<u64>,
+        /// ntfy server to announce finished stories on, e.g. http://ntfy
+        #[arg(long, env = "NTFY_URL")]
+        ntfy_url: Option<String>,
+        #[arg(long, env = "NTFY_TOPIC", default_value = "narrated")]
+        ntfy_topic: String,
+        #[arg(long, env = "NTFY_TOKEN", hide_env_values = true)]
+        ntfy_token: Option<String>,
         /// Seconds to wait for the model servers to finish loading before narrating
         #[arg(long, default_value_t = 1200)]
         ready_timeout: u64,
@@ -243,6 +250,9 @@ fn main() -> Result<()> {
             failed_label,
             max,
             watch,
+            ntfy_url,
+            ntfy_topic,
+            ntfy_token,
             ready_timeout,
             out,
             public_url,
@@ -258,6 +268,11 @@ fn main() -> Result<()> {
                 failed_label,
                 max,
                 ready_timeout,
+                ntfy: ntfy_url.map(|url| worker::Ntfy {
+                    url,
+                    topic: ntfy_topic,
+                    token: ntfy_token,
+                }),
                 out,
                 public_url,
                 feed_title,
@@ -449,6 +464,7 @@ struct WorkOpts {
     failed_label: String,
     max: usize,
     ready_timeout: u64,
+    ntfy: Option<worker::Ntfy>,
     out: PathBuf,
     public_url: String,
     feed_title: String,
@@ -511,10 +527,27 @@ fn work(w: &WorkOpts, mut fr: FreshRss, tts: &TtsArgs, d: &DirectorArgs) -> Resu
                         e.title, ep.duration_s, ep.audio_bytes
                     );
                     relabel(&mut fr, e, label, &w.done_label);
+                    let base = w.public_url.trim_end_matches('/');
+                    notify(
+                        w,
+                        &format!("Narrated: {}", e.title),
+                        &format!("{:.0} min from {}", (ep.duration_s / 60.0).max(1.0), e.feed),
+                        Some(&format!("{base}/")),
+                        Some(&format!("{base}/{}", ep.audio_file)),
+                        &["headphones"],
+                    );
                 }
                 Err(err) => {
                     eprintln!("could not narrate {:?}: {err:#}", e.title);
                     relabel(&mut fr, e, label, &w.failed_label);
+                    notify(
+                        w,
+                        &format!("Could not narrate: {}", e.title),
+                        &format!("{err:#}"),
+                        None,
+                        None,
+                        &["warning"],
+                    );
                 }
             }
         }
@@ -555,6 +588,15 @@ fn waiting(
 fn relabel(fr: &mut FreshRss, e: &freshrss_tts::freshrss::Entry, from: &str, to: &str) {
     if let Err(err) = fr.edit_labels(std::slice::from_ref(&e.id), &[to], &[from]) {
         eprintln!("could not relabel {:?}: {err:#}", e.title);
+    }
+}
+
+/// Tell the user (ntfy, if configured). A failed notification never fails the work.
+fn notify(w: &WorkOpts, title: &str, message: &str, click: Option<&str>, play: Option<&str>, tags: &[&str]) {
+    if let Some(ntfy) = &w.ntfy {
+        if let Err(e) = ntfy.publish(title, message, click, play, tags) {
+            eprintln!("could not notify: {e:#}");
+        }
     }
 }
 

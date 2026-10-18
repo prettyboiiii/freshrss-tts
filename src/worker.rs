@@ -2,6 +2,7 @@
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -60,6 +61,40 @@ pub fn load_episodes(dir: &Path) -> Result<Vec<Episode>> {
         }
     }
     Ok(episodes)
+}
+
+/// Where to announce finished stories: an ntfy server (JSON publishing, optional bearer token).
+#[derive(Debug, Clone)]
+pub struct Ntfy {
+    pub url: String,
+    pub topic: String,
+    pub token: Option<String>,
+}
+
+impl Ntfy {
+    /// `click` opens when the notification is tapped; `play` becomes a "Play" button.
+    pub fn publish(
+        &self,
+        title: &str,
+        message: &str,
+        click: Option<&str>,
+        play: Option<&str>,
+        tags: &[&str],
+    ) -> Result<()> {
+        let mut body = json!({"topic": self.topic, "title": title, "message": message, "tags": tags});
+        if let Some(url) = click {
+            body["click"] = json!(url);
+        }
+        if let Some(url) = play {
+            body["actions"] = json!([{"action": "view", "label": "Play", "url": url}]);
+        }
+        let mut req = ureq::post(self.url.trim_end_matches('/')).timeout(Duration::from_secs(20));
+        if let Some(token) = &self.token {
+            req = req.set("Authorization", &format!("Bearer {token}"));
+        }
+        req.send_json(body).context("publishing to ntfy")?;
+        Ok(())
+    }
 }
 
 /// Wait until every llama-server answers `/health` with something other than 503 (still loading) or a

@@ -400,3 +400,93 @@ fn work_narrates_encodes_publishes_a_feed_and_relabels() {
     assert!(out(&o).contains("0 stories to narrate"), "{}", out(&o));
     assert_eq!(tts.requests().len(), before, "nothing was narrated twice");
 }
+
+#[test]
+fn queue_serves_the_number_of_waiting_stories() {
+    use std::io::{Read, Write};
+    let fr = MockServer::start(fake_freshrss);
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let listen = format!("127.0.0.1:{port}");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_freshrss-tts"))
+        .args([
+            "queue",
+            "--url",
+            &fr.url,
+            "--user",
+            "me",
+            "--api-password",
+            "pw",
+            "--listen",
+            &listen,
+        ])
+        .stdout(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut reply = String::new();
+    for _ in 0..100 {
+        if let Ok(mut s) = std::net::TcpStream::connect(&listen) {
+            s.write_all(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
+            s.read_to_string(&mut reply).unwrap();
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    child.kill().unwrap();
+    child.wait().unwrap();
+    assert!(reply.starts_with("HTTP/1.1 200 OK"), "{reply}");
+    // the same story sits under both default labels in the mock, and is counted once
+    assert!(reply.ends_with("{\"queue\":1}"), "{reply}");
+}
+
+#[test]
+fn work_waits_for_servers_that_are_still_loading() {
+    let fr = MockServer::start(fake_freshrss);
+    let loading = MockServer::start(|_| common::Resp::status(503, "loading"));
+    let dir = tempfile::tempdir().unwrap();
+    let out_dir = dir.path().join("pod");
+    let mut args = work_args(&fr.url, out_dir.to_str().unwrap());
+    args.extend(["--server", &loading.url, "--ready-timeout", "1"]);
+    let o = run(&args);
+    assert!(!o.status.success());
+    assert!(err(&o).contains("was not ready"), "{}", err(&o));
+    assert!(
+        fr.requests().iter().all(|r| !r.path().ends_with("/edit-tag")),
+        "nothing relabelled"
+    );
+}
+
+#[test]
+fn work_moves_a_story_that_cannot_be_narrated_to_the_failed_label() {
+    let dir = tempfile::tempdir().unwrap();
+    let snac = dir.path().join("snac");
+    std::fs::create_dir(&snac).unwrap();
+    freshrss_tts::testing::write_zero_weight_snac(&snac).unwrap();
+    let fr = MockServer::start(fake_freshrss);
+    let broken = MockServer::start(|_| common::Resp::status(500, "boom"));
+    let out_dir = dir.path().join("pod");
+    let mut args = work_args(&fr.url, out_dir.to_str().unwrap());
+    args.extend(["--server", &broken.url, "--snac-dir", snac.to_str().unwrap()]);
+    let o = run(&args);
+    assert!(o.status.success(), "{}", err(&o));
+    assert!(err(&o).contains("could not narrate"), "{}", err(&o));
+    let tag = fr
+        .requests()
+        .into_iter()
+        .find(|r| r.path().ends_with("/edit-tag"))
+        .expect("relabelled");
+    assert!(
+        tag.body.contains("a=user%2F-%2Flabel%2Fnarrate-failed"),
+        "{}",
+        tag.body
+    );
+    assert!(
+        tag.body.contains("r=user%2F-%2Flabel%2Fnarrate-scary"),
+        "{}",
+        tag.body
+    );
+    assert!(!out_dir.join("00000000000000a1.episode.json").exists());
+}

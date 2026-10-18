@@ -44,6 +44,9 @@ vocab!(
 pub const DEFAULT_NARRATOR: &str = "Adult male narrator, deep warm voice, measured storytelling pace";
 pub const MAX_PAUSE_MS: u32 = 1500;
 const MAX_SPEAKER_CHARS: usize = 200;
+/// A pause this long counts as a dramatic one; two of them need at least `LONG_PAUSE_GAP` sentences between.
+const LONG_PAUSE_MS: u32 = 600;
+const LONG_PAUSE_GAP: usize = 5;
 
 /// How one sentence is performed. `mood` and `delivery` persist; `beat` and `pause_ms` do not.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -293,6 +296,7 @@ pub fn resolve(sentences: &[Sentence], raw: Option<&str>, state: Directive) -> R
 
     let (mut mood, mut delivery) = (state.mood, state.delivery);
     let mut speaker: Option<String> = None;
+    let mut since_long = LONG_PAUSE_GAP;
     let mut segments = Vec::with_capacity(sentences.len());
     for (pos, s) in sentences.iter().enumerate() {
         let empty = Map::new();
@@ -333,6 +337,18 @@ pub fn resolve(sentences: &[Sentence], raw: Option<&str>, state: Directive) -> R
                 }
                 None => repaired += 1,
             }
+        }
+        // Small models ramp pauses up toward a climax; keep long ones rare so the story keeps moving.
+        if pause >= LONG_PAUSE_MS {
+            if since_long < LONG_PAUSE_GAP {
+                pause = default_pause_ms(&s.text, last_in_par);
+                repaired += 1;
+                since_long += 1;
+            } else {
+                since_long = 0;
+            }
+        } else {
+            since_long += 1;
         }
         // A character's voice is only meaningful for sentences with quoted words; a quote that runs
         // over several sentences keeps its speaker.
@@ -548,6 +564,26 @@ mod tests {
         assert_eq!(default_pause_ms("He said \"run!\"", false), 200);
         assert_eq!(default_pause_ms("Wait...", false), 300);
         assert_eq!(default_pause_ms("Fine.", false), 120);
+    }
+
+    #[test]
+    fn long_pauses_are_kept_rare() {
+        let sentences = split_sentences(
+            "One ran. Two ran. Three ran. Four ran. Five ran. Six ran. Seven ran. Eight ran.",
+        );
+        // a steady ramp of long pauses, as small models like to produce
+        let events: Vec<_> = (0..8)
+            .map(|i| json!({"i": i, "pause_ms": 1000 + 100 * i}))
+            .collect();
+        let raw = json!({"narrator_voice": "v", "events": events}).to_string();
+        let r = resolve(&sentences, Some(&raw), Directive::default());
+        let long: Vec<_> = r
+            .segments
+            .iter()
+            .map(|s| s.directive.pause_ms >= LONG_PAUSE_MS)
+            .collect();
+        assert_eq!(long, [true, false, false, false, false, false, true, false]);
+        assert!(r.repaired >= 6);
     }
 
     #[test]

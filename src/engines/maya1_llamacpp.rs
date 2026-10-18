@@ -162,7 +162,7 @@ impl Maya1LlamaCpp {
     }
 
     /// Stream tokens until the end-of-speech token (checked client-side: it is not an EOS to llama.cpp).
-    pub fn generate_tokens(&self, prompt: &[u32]) -> Result<(Vec<u32>, GenStats)> {
+    pub fn generate_tokens(&self, prompt: &[u32], seed: Option<i64>) -> Result<(Vec<u32>, GenStats)> {
         let mut body = json!({
             "prompt": prompt,
             "n_predict": self.n_predict,
@@ -173,7 +173,7 @@ impl Maya1LlamaCpp {
             "top_k": self.sampling.top_k,
             "repeat_penalty": self.sampling.repeat_penalty,
         });
-        if let Some(seed) = self.sampling.seed {
+        if let Some(seed) = self.sampling.seed.or(seed) {
             body["seed"] = json!(seed);
         }
         let resp = self
@@ -228,7 +228,7 @@ impl Engine for Maya1LlamaCpp {
 
     fn synth(&mut self, chunk: &Chunk) -> Result<Vec<u8>> {
         let ids = maya1::build_prompt_ids(&mut |t| self.tokenize(t), &chunk.style, &chunk.text)?;
-        let (tokens, stats) = self.generate_tokens(&ids)?;
+        let (tokens, stats) = self.generate_tokens(&ids, chunk.seed)?;
         self.last_stats = stats;
         let snac_tokens: Vec<u32> = tokens
             .into_iter()

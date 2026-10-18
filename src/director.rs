@@ -45,7 +45,7 @@ pub const DEFAULT_NARRATOR: &str = "Adult male narrator, deep warm voice, measur
 pub const MAX_PAUSE_MS: u32 = 1500;
 const MAX_SPEAKER_CHARS: usize = 200;
 /// A pause this long counts as a dramatic one; two of them need at least `LONG_PAUSE_GAP` sentences between.
-const LONG_PAUSE_MS: u32 = 600;
+const LONG_PAUSE_MS: u32 = 1100;
 const LONG_PAUSE_GAP: usize = 5;
 
 /// How one sentence is performed. `mood` and `delivery` persist; `beat` and `pause_ms` do not.
@@ -150,7 +150,7 @@ dread, a character whispering). \"raised\" is for shouting.\n\
   - beat: none, {beats}. A short non-verbal sound spoken BEFORE that one sentence. Use rarely, only \
 when the text implies the sound.\n\
   - pause_ms: silence after that one sentence, 0-{max_pause}, in steps of 100. The default is already \
-right for most sentences; set it only for a few key moments (800-{max_pause} before a reveal or after \
+right for most sentences; set it only for a few key moments (1200-{max_pause} before a reveal or after \
 a scare), never as a steady ramp.\n\
   - speaker: for a sentence with words in quotation marks spoken by a character OTHER than the \
 narrator: who that character is, as a voice description of identity only (gender, approximate age, \
@@ -240,7 +240,7 @@ fn loads(raw: &str) -> Option<Map<String, Value>> {
 
 pub fn default_pause_ms(text: &str, last_in_paragraph: bool) -> u32 {
     if last_in_paragraph {
-        450
+        900
     } else if text.ends_with('\u{2026}') || text.ends_with("...") {
         300
     } else if text
@@ -560,7 +560,7 @@ mod tests {
             &PlanOptions::default(),
         );
         assert_eq!(plan.segments[0].directive.pause_ms, MAX_PAUSE_MS);
-        assert_eq!(plan.segments[1].directive.pause_ms, 450); // last sentence of its paragraph
+        assert_eq!(plan.segments[1].directive.pause_ms, 900); // last sentence of its paragraph
         assert_eq!(default_pause_ms("What?", false), 200);
         assert_eq!(default_pause_ms("He said \"run!\"", false), 200);
         assert_eq!(default_pause_ms("Wait...", false), 300);
@@ -574,7 +574,7 @@ mod tests {
         );
         // a steady ramp of long pauses, as small models like to produce
         let events: Vec<_> = (0..8)
-            .map(|i| json!({"i": i, "pause_ms": 1000 + 100 * i}))
+            .map(|i| json!({"i": i, "pause_ms": 1200 + 100 * i}))
             .collect();
         let raw = json!({"narrator_voice": "v", "events": events}).to_string();
         let r = resolve(&sentences, Some(&raw), Directive::default());

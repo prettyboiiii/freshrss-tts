@@ -40,6 +40,7 @@ fn chunk(style: String, text: String, pause_ms: u32) -> Chunk {
         text,
         style,
         pause_ms,
+        seed: None,
         parts: Vec::new(),
     }
 }

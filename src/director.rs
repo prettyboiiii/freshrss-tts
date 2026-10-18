@@ -149,10 +149,11 @@ when the text implies the sound.\n\
   - pause_ms: silence after that one sentence, 0-{max_pause}, in steps of 100. The default is already \
 right for most sentences; set it only for a few key moments (800-{max_pause} before a reveal or after \
 a scare), never as a steady ramp.\n\
-  - speaker: for a sentence that contains words in quotation marks spoken by a character OTHER than the \
-narrator: a short voice description of that character (gender, age, pitch, manner, e.g. \"young boy, \
-scared, higher pitch\"). Use exactly the same description every time that character speaks. Omit it for \
-the narrator's own quoted words and for sentences without quotes.\n\
+  - speaker: for a sentence with words in quotation marks spoken by a character OTHER than the \
+narrator: who that character is, as a voice description of identity only (gender, approximate age, \
+pitch), e.g. \"boy, about 12, higher pitch\". Never put emotion in it, that is what mood is for. Copy \
+exactly the same words every time that character speaks, so the voice stays the same. Omit speaker when \
+the narrator (the \"I\" of the story) is the one speaking, and for sentences without quotes.\n\
 Sentence numbers must come from the list. Never invent text.",
         moods = join_vocab(Mood::ALL, Mood::as_str),
         deliveries = join_vocab(Delivery::ALL, Delivery::as_str),

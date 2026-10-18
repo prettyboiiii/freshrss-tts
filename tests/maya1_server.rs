@@ -145,6 +145,7 @@ fn end_to_end_story_to_wav_with_mock_servers() {
         Some(&Scripted),
         &PlanOptions::default(),
         &out,
+        &mut |_, _| {},
     )
     .unwrap();
 

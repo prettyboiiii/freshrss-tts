@@ -3,7 +3,7 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 pub const EPISODE_SUFFIX: &str = ".episode.json";
@@ -40,6 +40,63 @@ pub fn slug(entry_id: &str) -> String {
         format!("entry-{h:016x}")
     } else {
         clean
+    }
+}
+
+pub const STATUS_FILE: &str = "status.json";
+
+/// A story this pass is going to narrate. `done`/`total` count synthesised chunks; `total` is 0 until
+/// the director has planned the story.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Job {
+    pub slug: String,
+    pub title: String,
+    pub source: String,
+    pub done: usize,
+    pub total: usize,
+}
+
+/// What the worker is doing right now, for the web UI: `<out>/status.json`, replaced atomically on every
+/// change. The first job in the list is the one being narrated; `jobs` is empty when the pass is over.
+pub struct Status {
+    path: PathBuf,
+    jobs: Vec<Job>,
+}
+
+impl Status {
+    pub fn new(dir: &Path, jobs: Vec<Job>) -> Self {
+        let s = Self {
+            path: dir.join(STATUS_FILE),
+            jobs,
+        };
+        s.write();
+        s
+    }
+
+    pub fn progress(&mut self, slug: &str, done: usize, total: usize) {
+        if let Some(j) = self.jobs.iter_mut().find(|j| j.slug == slug) {
+            j.done = done;
+            j.total = total;
+            self.write();
+        }
+    }
+
+    /// The story is finished or failed: drop it.
+    pub fn remove(&mut self, slug: &str) {
+        self.jobs.retain(|j| j.slug != slug);
+        self.write();
+    }
+
+    /// Best effort: progress is a nicety and must never fail the narration.
+    fn write(&self) {
+        let updated = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        let tmp = self.path.with_extension("json.tmp");
+        let body = json!({"updated": updated, "jobs": self.jobs}).to_string();
+        if let Err(e) = std::fs::write(&tmp, body).and_then(|()| std::fs::rename(&tmp, &self.path)) {
+            eprintln!("could not write {}: {e}", self.path.display());
+        }
     }
 }
 
@@ -247,6 +304,30 @@ mod tests {
             "newest first"
         );
         assert!(xml.ends_with("</channel>\n</rss>\n"));
+    }
+
+    #[test]
+    fn status_lists_the_jobs_and_empties_when_done() {
+        let dir = tempfile::tempdir().unwrap();
+        let job = |slug: &str| Job {
+            slug: slug.into(),
+            title: slug.into(),
+            source: "r/nosleep".into(),
+            done: 0,
+            total: 0,
+        };
+        let read = || -> serde_json::Value {
+            serde_json::from_str(&std::fs::read_to_string(dir.path().join(STATUS_FILE)).unwrap()).unwrap()
+        };
+        let mut st = Status::new(dir.path(), vec![job("a"), job("b")]);
+        assert_eq!(read()["jobs"].as_array().unwrap().len(), 2);
+        st.progress("a", 3, 22);
+        assert_eq!(read()["jobs"][0]["done"], 3);
+        assert_eq!(read()["jobs"][0]["total"], 22);
+        st.remove("a");
+        st.remove("b");
+        assert!(read()["jobs"].as_array().unwrap().is_empty());
+        assert!(read()["updated"].as_u64().unwrap() > 0);
     }
 
     #[test]
